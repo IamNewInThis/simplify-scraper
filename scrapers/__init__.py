@@ -1,0 +1,3 @@
+"""
+Scrapers específicos por retailer
+"""
