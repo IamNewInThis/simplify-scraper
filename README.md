@@ -48,9 +48,17 @@ pip install -r requirements.txt
 
 ### 3. Instalar navegadores de Playwright
 
+**⚠️ Importante:** Playwright requiere descargar los navegadores por separado (necesario en cualquier entorno).
+
 ```bash
+# Instalar solo Chromium (recomendado para scrapers)
+playwright install chromium
+
+# O instalar todos los navegadores (Chromium, Firefox, WebKit)
 playwright install
 ```
+
+> 📌 **Nota:** Cada navegador pesa ~100-300 MB. En producción/servidores, usa solo `chromium`.
 
 ### 4. Configurar variables de entorno
 

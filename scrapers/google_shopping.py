@@ -2,11 +2,12 @@
 Scraper para Google Shopping
 
 Obtiene precios de múltiples retailers desde Google Shopping.
-Usa técnicas anti-detección para evitar CAPTCHAs.
+Usa playwright-stealth para evitar detección en producción.
 """
 
 import asyncio
 from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 import re
 import random
 
@@ -29,87 +30,98 @@ async def scrape_google_shopping(search_term: str):
         list: Lista de diccionarios con información de cada vendedor
     """
     async with async_playwright() as p:
-        # Usar headless=False para evitar detección (luego configurar XVFB en producción)
+        # Configuración para producción con stealth
         browser = await p.chromium.launch(
-            headless=False,  # Cambiar a True con XVFB en producción
+            headless=False,  # En producción: True con Xvfb
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
+                '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process'
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--hide-scrollbars',
+                '--mute-audio',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
             ]
         )
         
         context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
             locale='es-CL',
             timezone_id='America/Santiago',
-            geolocation={'latitude': -33.4489, 'longitude': -70.6693},  # Santiago, Chile
-            permissions=['geolocation']
+            geolocation={'latitude': -33.4489, 'longitude': -70.6693},
+            permissions=['geolocation'],
+            # Headers extra para parecer más real
+            extra_http_headers={
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
         )
         
         page = await context.new_page()
         
-        # Scripts anti-detección
-        await page.add_init_script("""
-            // Eliminar webdriver
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => false
-            });
-            
-            // Agregar plugins
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            
-            // Agregar languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['es-CL', 'es', 'en']
-            });
-            
-            // Chrome runtime
-            window.chrome = {
-                runtime: {}
-            };
-            
-            // Permisos
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-            );
-        """)
+        # ✨ APLICAR PLAYWRIGHT-STEALTH (esto es lo importante)
+        stealth_config = Stealth()
+        await page.goto("about:blank")  # Necesario antes de aplicar stealth
+        stealth_config.apply_stealth_sync(page)
         
         try:
             # 1. Ir primero a Google.cl (comportamiento humano)
             print(f"[Google Shopping] Paso 1: Navegando a google.cl...")
-            await page.goto("https://www.google.cl", wait_until="networkidle", timeout=30000)
-            await page.wait_for_timeout(random.randint(3000, 5000))  # Esperar más tiempo
+            await page.goto("https://www.google.cl", wait_until="domcontentloaded", timeout=30000)
             
-            # 2. Simular movimiento de mouse
-            await page.mouse.move(random.randint(100, 500), random.randint(100, 500))
-            await page.wait_for_timeout(random.randint(1000, 2000))  # Más tiempo
+            # Esperar a que cargue completamente
+            await page.wait_for_load_state("networkidle", timeout=30000)
+            await page.wait_for_timeout(random.randint(2000, 3000))
+            
+            # 2. Simular comportamiento humano: varios movimientos de mouse
+            print(f"[Google Shopping] Simulando comportamiento natural...")
+            for _ in range(random.randint(2, 4)):
+                await page.mouse.move(
+                    random.randint(100, 1000), 
+                    random.randint(100, 800),
+                    steps=random.randint(10, 25)
+                )
+                await page.wait_for_timeout(random.randint(300, 800))
+            
+            # Scroll inicial suave
+            await page.evaluate('window.scrollTo({top: 150, behavior: "smooth"})')
+            await page.wait_for_timeout(random.randint(1000, 1500))
             
             # 3. Buscar el producto en el cuadro de búsqueda
             print(f"[Google Shopping] Paso 2: Buscando '{search_term}'...")
             search_box = await page.wait_for_selector('textarea[name="q"], input[name="q"]', timeout=10000)
             
-            # Escribir con delays naturales más lentos (simular tipeo humano)
-            for char in search_term:
-                await search_box.type(char, delay=random.randint(100, 250))  # Más lento
+            # Click en el search box primero (comportamiento humano)
+            await search_box.click()
+            await page.wait_for_timeout(random.randint(400, 700))
             
-            await page.wait_for_timeout(random.randint(1000, 2000))  # Más tiempo antes de Enter
+            # Escribir con delays naturales más lentos (simular tipeo humano)
+            for i, char in enumerate(search_term):
+                await search_box.type(char, delay=random.randint(80, 180))
+                # Pausas ocasionales como si pensara
+                if i > 0 and i % random.randint(8, 12) == 0:
+                    await page.wait_for_timeout(random.randint(200, 500))
+            
+            await page.wait_for_timeout(random.randint(1500, 2500))  # Pausa antes de Enter
             
             # 4. Presionar Enter
             await search_box.press('Enter')
-            await page.wait_for_timeout(random.randint(4000, 6000))  # Mucho más tiempo de espera
+            await page.wait_for_timeout(random.randint(5000, 7000))  # Espera larga después de búsqueda
             
             # 4.5. Scroll suave (comportamiento humano)
-            await page.evaluate('window.scrollTo({top: 200, behavior: "smooth"})')
-            await page.wait_for_timeout(random.randint(1500, 2500))
+            await page.evaluate('window.scrollTo({top: 250, behavior: "smooth"})')
+            await page.wait_for_timeout(random.randint(2000, 3000))
             
             # 5. Buscar y hacer clic en la pestaña "Shopping"
             print(f"[Google Shopping] Paso 3: Navegando a Shopping...")
