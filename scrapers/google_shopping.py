@@ -196,6 +196,51 @@ async def scrape_google_shopping(search_term: str):
                     # Esperar a que se abra el panel lateral con todos los vendedores
                     await page.wait_for_timeout(random.randint(5000, 7000))
                     
+                    # 7. Hacer clic en "Más tiendas" para cargar todos los vendedores
+                    print("[Google Shopping] Paso 4.5: Buscando botón 'Más tiendas'...")
+                    try:
+                        # Selectores para el botón "Más tiendas"
+                        more_stores_selectors = [
+                            'div.ZFiwCf',  # Contenedor principal
+                            'span:has-text("Más tiendas")',  # Por texto
+                            '.PBBEhf.JGD2rd:has-text("Más tiendas")',  # Clase específica con texto
+                        ]
+                        
+                        more_stores_button = None
+                        for selector in more_stores_selectors:
+                            try:
+                                more_stores_button = await page.wait_for_selector(selector, timeout=5000)
+                                if more_stores_button:
+                                    print(f"[Google Shopping] ✓ Botón 'Más tiendas' encontrado con: {selector}")
+                                    break
+                            except:
+                                continue
+                        
+                        if more_stores_button:
+                            # Hacer clic usando JavaScript para evitar problemas de intercepción
+                            await page.evaluate('(element) => element.click()', more_stores_button)
+                            print("[Google Shopping] ✓ Clic en 'Más tiendas' exitoso")
+                            
+                            # Esperar a que carguen más vendedores
+                            await page.wait_for_timeout(random.randint(3000, 5000))
+                            
+                            # Scroll adicional para asegurar que todo cargó
+                            await page.evaluate('''
+                                const panel = document.querySelector('[role="dialog"]') || document.querySelector('aside');
+                                if (panel) {
+                                    panel.scrollTop = panel.scrollHeight;
+                                } else {
+                                    window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"});
+                                }
+                            ''')
+                            await page.wait_for_timeout(random.randint(2000, 3000))
+                        else:
+                            print("[Google Shopping] ℹ️  Botón 'Más tiendas' no encontrado (pueden estar todos los vendedores visibles)")
+                    
+                    except Exception as e:
+                        print(f"[Google Shopping] ⚠️  Error buscando 'Más tiendas': {e}")
+                        # No es crítico, continuar con los vendedores visibles
+                    
                     # Scroll en el panel lateral para cargar más vendedores
                     # El panel puede tener su propio scroll, intentar múltiples estrategias
                     await page.evaluate('''
