@@ -6,33 +6,66 @@ Usa playwright-stealth para evitar detección en producción.
 """
 
 import asyncio
-from playwright.async_api import async_playwright
-from playwright_stealth import Stealth
 import re
 import random
+from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
 
 
-async def scrape_google_shopping(search_term: str):
+# Extrae nombre, precio CLP y tienda desde el aria-label de cada tarjeta de producto.
+# Formato: "<nombre>. Precio actual: CLP <precio>. <tienda> y más."
+# Usamos aria-label porque es requerido por accesibilidad y Google no lo rota.
+_ARIA_PRICE_RE = re.compile(
+    r'^(.+?)\.\s+Precio actual:\s+CLP\s+([\d\.,]+)\.\s+(.+?)(?:\s+y más)?(?:\.\s*.*)?$',
+    re.DOTALL
+)
+
+# Badges que pueden aparecer antes del nombre del retailer en el texto del panel
+_PANEL_BADGES = {'más popular', 'cerca', 'mejor precio', 'más vendido', 'oferta'}
+
+
+def _parse_panel_link_text(text: str) -> tuple[str, str]:
+    """
+    Parsea el texto de un link de panel: "<badge?>|<retailer>|CLP <precio>|..."
+    Retorna (retailer, precio_str) o ("", "") si no se puede parsear.
+    """
+    parts = [p.strip() for p in text.split('|') if p.strip()]
+    retailer = ""
+    price_str = ""
+
+    for i, part in enumerate(parts):
+        if part.lower() in _PANEL_BADGES:
+            continue
+        if not retailer:
+            retailer = part
+            continue
+        if part.upper().startswith('CLP'):
+            price_str = part
+            break
+
+    return retailer, price_str
+
+
+async def scrape_google_shopping(search_term: str) -> list[dict]:
     """
     Busca un producto en Google Shopping y extrae precios de todos los vendedores.
-    
-    Estrategia anti-detección:
-    - Inicia en Google.cl (no directo a Shopping)
-    - Simula búsqueda humana
-    - User agent real
-    - Delays aleatorios
-    - Movimientos de mouse
-    
+
+    Estrategia:
+    1. Navega Google.cl → busca → pestaña Shopping (anti-bot con delays y stealth)
+    2. Abre el panel de un producto y hace clic en "Más tiendas"
+    3. Extrae retailers del panel usando jsname="uwagwf" (estable, no depende de
+       clases CSS ofuscadas que Google rota frecuentemente)
+    4. Si el panel falla, extrae precios del resultado principal vía aria-label
+
     Args:
         search_term: Término de búsqueda (ej: "Leche Soprole Entera Natural 1 L")
-        
+
     Returns:
-        list: Lista de diccionarios con información de cada vendedor
+        list: [{"retailer", "nombre", "precio", "url", "encontrado"}, ...]
     """
     async with async_playwright() as p:
-        # Configuración para producción con stealth
         browser = await p.chromium.launch(
-            headless=False,  # En producción: True con Xvfb
+            headless=False,
             args=[
                 '--disable-blink-features=AutomationControlled',
                 '--no-sandbox',
@@ -49,7 +82,7 @@ async def scrape_google_shopping(search_term: str):
                 '--disable-renderer-backgrounding',
             ]
         )
-        
+
         context = await browser.new_context(
             user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080},
@@ -57,7 +90,6 @@ async def scrape_google_shopping(search_term: str):
             timezone_id='America/Santiago',
             geolocation={'latitude': -33.4489, 'longitude': -70.6693},
             permissions=['geolocation'],
-            # Headers extra para parecer más real
             extra_http_headers={
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
                 'Accept-Language': 'es-CL,es;q=0.9,en;q=0.8',
@@ -67,348 +99,277 @@ async def scrape_google_shopping(search_term: str):
                 'Upgrade-Insecure-Requests': '1',
             }
         )
-        
+
         page = await context.new_page()
-        
-        # ✨ APLICAR PLAYWRIGHT-STEALTH (esto es lo importante)
+
         stealth_config = Stealth()
-        await page.goto("about:blank")  # Necesario antes de aplicar stealth
+        await page.goto("about:blank")
         stealth_config.apply_stealth_sync(page)
-        
+
         try:
-            # 1. Ir primero a Google.cl (comportamiento humano)
+            # 1. Navegar a Google.cl
             print(f"[Google Shopping] Paso 1: Navegando a google.cl...")
             await page.goto("https://www.google.cl", wait_until="domcontentloaded", timeout=30000)
-            
-            # Esperar a que cargue completamente
             await page.wait_for_load_state("networkidle", timeout=30000)
             await page.wait_for_timeout(random.randint(2000, 3000))
-            
-            # 2. Simular comportamiento humano: varios movimientos de mouse
+
+            # Simular comportamiento humano
             print(f"[Google Shopping] Simulando comportamiento natural...")
             for _ in range(random.randint(2, 4)):
                 await page.mouse.move(
-                    random.randint(100, 1000), 
+                    random.randint(100, 1000),
                     random.randint(100, 800),
                     steps=random.randint(10, 25)
                 )
                 await page.wait_for_timeout(random.randint(300, 800))
-            
-            # Scroll inicial suave
             await page.evaluate('window.scrollTo({top: 150, behavior: "smooth"})')
             await page.wait_for_timeout(random.randint(1000, 1500))
-            
-            # 3. Buscar el producto en el cuadro de búsqueda
+
+            # 2. Buscar el producto
             print(f"[Google Shopping] Paso 2: Buscando '{search_term}'...")
             search_box = await page.wait_for_selector('textarea[name="q"], input[name="q"]', timeout=10000)
-            
-            # Click en el search box primero (comportamiento humano)
             await search_box.click()
             await page.wait_for_timeout(random.randint(400, 700))
-            
-            # Escribir con delays naturales más lentos (simular tipeo humano)
             for i, char in enumerate(search_term):
                 await search_box.type(char, delay=random.randint(80, 180))
-                # Pausas ocasionales como si pensara
                 if i > 0 and i % random.randint(8, 12) == 0:
                     await page.wait_for_timeout(random.randint(200, 500))
-            
-            await page.wait_for_timeout(random.randint(1500, 2500))  # Pausa antes de Enter
-            
-            # 4. Presionar Enter
+            await page.wait_for_timeout(random.randint(1500, 2500))
             await search_box.press('Enter')
-            await page.wait_for_timeout(random.randint(5000, 7000))  # Espera larga después de búsqueda
-            
-            # 4.5. Scroll suave (comportamiento humano)
+            await page.wait_for_timeout(random.randint(5000, 7000))
             await page.evaluate('window.scrollTo({top: 250, behavior: "smooth"})')
             await page.wait_for_timeout(random.randint(2000, 3000))
-            
-            # 5. Buscar y hacer clic en la pestaña "Shopping"
+
+            # 3. Ir a la pestaña Shopping
             print(f"[Google Shopping] Paso 3: Navegando a Shopping...")
-            try:
-                # Intentar varios selectores para el botón de Shopping
-                shopping_selectors = [
-                    'a[href*="tbm=shop"]',  # Enlace directo a Shopping
-                    'a:has-text("Shopping")',  # Texto visible "Shopping"
-                    'div[role="tab"]:has-text("Shopping")',  # Tab de Shopping  
-                    'a.YyVfkd:has-text("Shopping")',  # Clase específica
-                    '[data-async-trigger="tbm_shop"]',  # Trigger async
-                ]
-                
-                shopping_button = None
-                for selector in shopping_selectors:
-                    try:
-                        shopping_button = await page.wait_for_selector(selector, timeout=8000)
-                        if shopping_button:
-                            print(f"[Google Shopping] ✓ Botón Shopping encontrado con selector: {selector}")
-                            break
-                    except:
-                        continue
-                
-                if not shopping_button:
-                    raise Exception("No se encontró el botón Shopping en ningún selector")
-                
-                # Mover mouse al botón (comportamiento humano)
-                    box = await shopping_button.bounding_box()
-                    if box:
-                        await page.mouse.move(
-                            box['x'] + box['width']/2, 
-                            box['y'] + box['height']/2,
-                            steps=random.randint(5, 15)
-                        )
-                        await page.wait_for_timeout(random.randint(500, 1000))
-                
-                # Hacer clic en el botón Shopping
-                await shopping_button.click()
-                print(f"[Google Shopping] ✓ Clic en Shopping exitoso")
-                await page.wait_for_timeout(random.randint(5000, 7000))
-                
-                # Scroll suave después del clic
-                await page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
-                await page.wait_for_timeout(random.randint(2000, 3000))
-                    
-            except Exception as e:
-                print(f"[Google Shopping] ❌ Error fatal: No se puede acceder a Shopping - {e}")
-                # NO HACER FALLBACK A URL DIRECTA - causa CAPTCHA
-                raise Exception(f"No se puede acceder a Shopping: {e}")
-            
-            # 6. Hacer clic en el primer producto para ver todos los vendedores
-            print("[Google Shopping] Paso 4: Haciendo clic en el primer producto...")
-            try:
-                # Buscar el primer producto usando los selectores correctos
-                first_product = await page.wait_for_selector('div.njFjte[jsname="ZvZkAe"]', timeout=10000)
-                
-                if first_product:
-                    # Mover mouse al producto (comportamiento humano)
-                    box = await first_product.bounding_box()
-                    if box:
-                        await page.mouse.move(
-                            box['x'] + box['width']/2,
-                            box['y'] + box['height']/2,
-                            steps=random.randint(5, 10)
-                        )
-                        await page.wait_for_timeout(random.randint(500, 1000))
-                    
-                    # Hacer clic usando JavaScript (más confiable cuando hay elementos encima)
-                    await page.evaluate('(element) => element.click()', first_product)
-                    print("[Google Shopping] ✓ Producto clickeado, esperando panel lateral...")
-                    
-                    # Esperar a que se abra el panel lateral con todos los vendedores
-                    await page.wait_for_timeout(random.randint(5000, 7000))
-                    
-                    # 7. Hacer clic en "Más tiendas" para cargar todos los vendedores
-                    print("[Google Shopping] Paso 4.5: Buscando botón 'Más tiendas'...")
-                    try:
-                        # Selectores para el botón "Más tiendas"
-                        more_stores_selectors = [
-                            'div.ZFiwCf',  # Contenedor principal
-                            'span:has-text("Más tiendas")',  # Por texto
-                            '.PBBEhf.JGD2rd:has-text("Más tiendas")',  # Clase específica con texto
-                        ]
-                        
-                        more_stores_button = None
-                        for selector in more_stores_selectors:
-                            try:
-                                more_stores_button = await page.wait_for_selector(selector, timeout=5000)
-                                if more_stores_button:
-                                    print(f"[Google Shopping] ✓ Botón 'Más tiendas' encontrado con: {selector}")
-                                    break
-                            except:
-                                continue
-                        
-                        if more_stores_button:
-                            # Hacer clic usando JavaScript para evitar problemas de intercepción
-                            await page.evaluate('(element) => element.click()', more_stores_button)
-                            print("[Google Shopping] ✓ Clic en 'Más tiendas' exitoso")
-                            
-                            # Esperar a que carguen más vendedores
-                            await page.wait_for_timeout(random.randint(3000, 5000))
-                            
-                            # Scroll adicional para asegurar que todo cargó
-                            await page.evaluate('''
-                                const panel = document.querySelector('[role="dialog"]') || document.querySelector('aside');
-                                if (panel) {
-                                    panel.scrollTop = panel.scrollHeight;
-                                } else {
-                                    window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"});
-                                }
-                            ''')
-                            await page.wait_for_timeout(random.randint(2000, 3000))
-                        else:
-                            print("[Google Shopping] ℹ️  Botón 'Más tiendas' no encontrado (pueden estar todos los vendedores visibles)")
-                    
-                    except Exception as e:
-                        print(f"[Google Shopping] ⚠️  Error buscando 'Más tiendas': {e}")
-                        # No es crítico, continuar con los vendedores visibles
-                    
-                    # Scroll en el panel lateral para cargar más vendedores
-                    # El panel puede tener su propio scroll, intentar múltiples estrategias
-                    await page.evaluate('''
-                        // Intentar scrollear el panel lateral si existe
-                        const panel = document.querySelector('[role="dialog"]') || document.querySelector('aside');
-                        if (panel) {
-                            panel.scrollTop = 1000;
-                        } else {
-                            window.scrollTo({top: 800, behavior: "smooth"});
-                        }
-                    ''')
-                    await page.wait_for_timeout(random.randint(2000, 3000))
-                    
-                    # Scroll adicional para cargar más vendedores
-                    await page.evaluate('''
-                        const panel = document.querySelector('[role="dialog"]') || document.querySelector('aside');
-                        if (panel) {
-                            panel.scrollTop = 2000;
-                        } else {
-                            window.scrollTo({top: 1500, behavior: "smooth"});
-                        }
-                    ''')
-                    await page.wait_for_timeout(random.randint(1500, 2500))
-                else:
-                    print("[Google Shopping] ⚠️  No se encontró el primer producto")
-                    
-            except Exception as e:
-                print(f"[Google Shopping] Error haciendo clic en producto: {e}")
-            
-            # 7. Guardar screenshot para debug
-            await page.screenshot(path="/tmp/google_shopping.png")
-            print("[Google Shopping] Screenshot guardado en /tmp/google_shopping.png")
-            
-            # 8. Verificar si hay CAPTCHA
+            shopping_selectors = [
+                'a[href*="tbm=shop"]',
+                'a:has-text("Shopping")',
+                'div[role="tab"]:has-text("Shopping")',
+                '[data-async-trigger="tbm_shop"]',
+            ]
+            shopping_button = None
+            for selector in shopping_selectors:
+                try:
+                    shopping_button = await page.wait_for_selector(selector, timeout=8000)
+                    if shopping_button:
+                        print(f"[Google Shopping] ✓ Botón Shopping: {selector}")
+                        break
+                except Exception:
+                    continue
+            if not shopping_button:
+                raise Exception("No se encontró el botón Shopping")
+
+            box = await shopping_button.bounding_box()
+            if box:
+                await page.mouse.move(
+                    box['x'] + box['width'] / 2,
+                    box['y'] + box['height'] / 2,
+                    steps=random.randint(5, 15)
+                )
+                await page.wait_for_timeout(random.randint(500, 1000))
+            await shopping_button.click()
+            print(f"[Google Shopping] ✓ Clic en Shopping exitoso")
+            await page.wait_for_timeout(random.randint(5000, 7000))
+            await page.evaluate('window.scrollTo({top: 300, behavior: "smooth"})')
+            await page.wait_for_timeout(random.randint(2000, 3000))
+
+            # Verificar CAPTCHA
             content = await page.content()
             if 'recaptcha' in content.lower() or 'captcha' in content.lower():
-                print("[Google Shopping] ⚠️  CAPTCHA detectado - Google está bloqueando")
+                print("[Google Shopping] ⚠️  CAPTCHA detectado")
                 with open('/tmp/google_shopping_captcha.html', 'w', encoding='utf-8') as f:
                     f.write(content)
                 await browser.close()
-                return [{
-                    "retailer": "Google Shopping",
-                    "nombre": "CAPTCHA detectado - Google bloqueó la solicitud",
-                    "precio": "N/A",
-                    "sku": "N/A",
-                    "url": page.url,
-                    "encontrado": False,
-                    "error": "CAPTCHA"
-                }]
-            
-            results = []
-            
-            # 9. Extraer todos los vendedores del panel lateral
-            print(f"[Google Shopping] Paso 5: Extrayendo vendedores del panel lateral...")
-            # Selector correcto basado en el HTML real de Google Shopping
-            # Cada vendedor está en un div con role="listitem" y clase R5K7Cb
-            product_items = await page.query_selector_all('div.R5K7Cb[role="listitem"]')
-            
-            print(f"[Google Shopping] Encontrados {len(product_items)} productos")
-            
-            if len(product_items) == 0:
-                # Intentar obtener el HTML completo para ver la estructura
-                content = await page.content()
-                print(f"[Google Shopping] No se encontraron productos con el selector")
-                print(f"[Google Shopping] Guardando HTML para análisis...")
-                with open('/tmp/google_shopping.html', 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print("[Google Shopping] HTML guardado en /tmp/google_shopping.html")
-            
-            for idx, item in enumerate(product_items[:20]):  # Máximo 20 vendedores
-                try:
-                    product_name = None
-                    product_price = None
-                    retailer_name = None
-                    product_url = None
-                    
-                    # Extraer nombre del vendedor/retailer (div.hP4iBf.gUf0b.uWvFpd)
-                    retailer_element = await item.query_selector('div.hP4iBf.gUf0b.uWvFpd')
-                    if retailer_element:
-                        retailer_name = await retailer_element.inner_text()
-                        retailer_name = retailer_name.strip()
-                    
-                    # Extraer precio (div.GBgquf.JIep9e > span con aria-label)
-                    price_element = await item.query_selector('div.GBgquf.JIep9e span[aria-label]')
-                    if price_element:
-                        aria_label = await price_element.get_attribute('aria-label')
-                        if aria_label:
-                            # Extraer el precio del aria-label (ej: "Precio actual: CLP 1,150")
-                            price_match = re.search(r'CLP\s*([\d\.,]+)', aria_label)
-                            if price_match:
-                                product_price = f"${price_match.group(1)}"
-                    
-                    # Si no encontramos precio con aria-label, intentar con el texto
-                    if not product_price:
-                        price_element = await item.query_selector('div.GBgquf.JIep9e')
-                        if price_element:
-                            price_text = await price_element.inner_text()
-                            price_match = re.search(r'CLP\s*([\d\.,]+)', price_text)
-                            if price_match:
-                                product_price = f"${price_match.group(1)}"
-                    
-                    # Extraer nombre del producto (div.Rp8BL.CpcIhb.y1FcZd.rYkzq)
-                    name_element = await item.query_selector('div.Rp8BL.CpcIhb.y1FcZd.rYkzq')
-                    if name_element:
-                        product_name = await name_element.inner_text()
-                        product_name = product_name.strip()
-                    
-                    # Extraer URL del producto (enlace principal con clase P9159d)
-                    link_element = await item.query_selector('a.P9159d[href]')
-                    if link_element:
-                        href = await link_element.get_attribute('href')
-                        if href:
-                            # Google Shopping usa URLs de redirección, extraer la URL real
-                            if 'url=' in href:
-                                from urllib.parse import unquote
-                                url_match = re.search(r'url=([^&]+)', href)
-                                if url_match:
-                                    product_url = unquote(url_match.group(1))
-                            else:
-                                product_url = href
-                    
-                    if product_name and product_price and retailer_name:
-                        results.append({
-                            "retailer": retailer_name,
-                            "nombre": product_name,
-                            "precio": product_price,
-                            "sku": "N/A",  # Google Shopping no muestra SKU
-                            "url": product_url or "",
-                            "encontrado": True
-                        })
-                        print(f"[Google Shopping] {idx+1}. {retailer_name}: {product_price} - {product_name[:50]}...")
-                    
-                except Exception as e:
-                    print(f"[Google Shopping] Error procesando item {idx+1}: {e}")
-                    continue
-            
+                return [_error_result(page.url, "CAPTCHA")]
+
+            # 4. Abrir panel del primer producto
+            print("[Google Shopping] Paso 4: Abriendo panel del primer producto...")
+            try:
+                first_product = await page.wait_for_selector('[jsname="ZvZkAe"]', timeout=10000)
+                if first_product:
+                    box = await first_product.bounding_box()
+                    if box:
+                        await page.mouse.move(
+                            box['x'] + box['width'] / 2,
+                            box['y'] + box['height'] / 2,
+                            steps=random.randint(5, 10)
+                        )
+                        await page.wait_for_timeout(random.randint(500, 1000))
+                    await page.evaluate('(el) => el.click()', first_product)
+                    print("[Google Shopping] ✓ Producto clickeado, esperando panel...")
+                    await page.wait_for_timeout(random.randint(5000, 7000))
+            except Exception as e:
+                print(f"[Google Shopping] ⚠️  No se pudo abrir panel: {e}")
+
+            # 5. Clic en "Más tiendas" para cargar todos los retailers
+            print("[Google Shopping] Paso 5: Buscando 'Más tiendas'...")
+            try:
+                more_stores = await page.wait_for_selector(
+                    'span:has-text("Más tiendas"), div.ZFiwCf', timeout=5000
+                )
+                if more_stores:
+                    await page.evaluate('(el) => el.click()', more_stores)
+                    print("[Google Shopping] ✓ Clic en 'Más tiendas'")
+                    await page.wait_for_timeout(random.randint(3000, 5000))
+                    # Scroll dentro del panel para cargar todos
+                    await page.evaluate('''
+                        const panel = document.querySelector('[role="dialog"]') || document.querySelector('aside');
+                        if (panel) panel.scrollTop = panel.scrollHeight;
+                        else window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"});
+                    ''')
+                    await page.wait_for_timeout(random.randint(2000, 3000))
+            except Exception:
+                print("[Google Shopping] ℹ️  Sin botón 'Más tiendas'")
+
+            await page.screenshot(path="/tmp/google_shopping.png")
+            print("[Google Shopping] Screenshot guardado en /tmp/google_shopping.png")
+
+            # 6. Extraer retailers del panel
+            # jsname="uwagwf" + role="listitem" es estable porque jsname es un
+            # identificador interno de Google, no una clase CSS ofuscada rotable.
+            results = await _extract_panel_results(page)
+
+            # Fallback: extraer del resultado principal via aria-label si el panel falla
+            if not results:
+                print("[Google Shopping] ℹ️  Panel vacío, extrayendo de resultados principales...")
+                results = await _extract_main_results(page)
+
             await browser.close()
-            
-            if len(results) == 0:
-                return [{
-                    "retailer": "Google Shopping",
-                    "nombre": "No se encontraron resultados",
-                    "precio": "N/A",
-                    "sku": "N/A",
-                    "url": page.url,
-                    "encontrado": False
-                }]
-            
-            print(f"\n[Google Shopping] Total de vendedores encontrados: {len(results)}")
+
+            if not results:
+                with open('/tmp/google_shopping_no_results.html', 'w', encoding='utf-8') as f:
+                    f.write(content)
+                print("[Google Shopping] No se encontraron resultados. HTML guardado.")
+                return [_error_result("", "Sin resultados")]
+
+            print(f"\n[Google Shopping] Total vendedores: {len(results)}")
             return results
-            
+
         except Exception as e:
             await browser.close()
             print(f"[Google Shopping] Error: {e}")
             import traceback
             traceback.print_exc()
-            return [{
-                "retailer": "Google Shopping",
-                "nombre": "Error",
-                "precio": "Error",
-                "sku": "Error",
+            return [_error_result("", str(e))]
+
+
+async def _extract_panel_results(page) -> list[dict]:
+    """
+    Extrae retailers del panel lateral usando jsname="uwagwf".
+    Cada item tiene un link directo al producto en la tienda.
+    """
+    # jsname="uwagwf" identifica cada fila de retailer en el panel de precio.
+    # Más estable que las clases CSS como R5K7Cb que Google rota frecuentemente.
+    items = await page.query_selector_all('div[jsname="uwagwf"][role="listitem"]')
+    print(f"[Google Shopping] Panel: {len(items)} retailers encontrados")
+
+    results = []
+    seen = set()
+
+    for idx, item in enumerate(items):
+        try:
+            # El link tiene href al producto en la tienda y texto con retailer + precio
+            link = await item.query_selector('a[href]:not([href*="google.com"])')
+            if not link:
+                continue
+
+            href = await link.get_attribute('href') or ''
+            text = await link.inner_text() or ''
+            text_pipe = '|'.join(t.strip() for t in text.split('\n') if t.strip())
+
+            retailer, price_str = _parse_panel_link_text(text_pipe)
+            if not retailer or not price_str:
+                continue
+
+            key = retailer.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Extraer nombre del producto del texto (parte después del precio)
+            product_name = ""
+            parts = [p.strip() for p in text_pipe.split('|') if p.strip()]
+            price_idx = next((i for i, p in enumerate(parts) if p.upper().startswith('CLP')), -1)
+            if price_idx >= 0 and price_idx + 1 < len(parts):
+                product_name = parts[price_idx + 1]
+
+            results.append({
+                "retailer": retailer,
+                "nombre": product_name,
+                "precio": price_str,
+                "sku": "N/A",
+                "url": href,
+                "encontrado": True
+            })
+            print(f"[Google Shopping] {len(results)}. {retailer}: {price_str}")
+
+        except Exception as e:
+            print(f"[Google Shopping] Error en item {idx+1}: {e}")
+            continue
+
+    return results
+
+
+async def _extract_main_results(page) -> list[dict]:
+    """
+    Fallback: extrae precios del resultado principal de la búsqueda vía aria-label.
+    No incluye URL directa al producto en la tienda.
+    """
+    cards = await page.query_selector_all('[jsname="ZvZkAe"]')
+    print(f"[Google Shopping] Resultados principales: {len(cards)} tarjetas")
+
+    results = []
+    seen = set()
+
+    for idx, card in enumerate(cards[:40]):
+        try:
+            label = await card.get_attribute('aria-label') or ''
+            m = _ARIA_PRICE_RE.match(label.strip())
+            if not m:
+                continue
+
+            product_name = m.group(1).strip()
+            price_str = f"CLP {m.group(2).strip()}"
+            retailer = m.group(3).strip()
+
+            if 'general' in retailer.lower() or 'precio' in retailer.lower():
+                continue
+
+            key = (retailer.lower(), m.group(2))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            results.append({
+                "retailer": retailer,
+                "nombre": product_name,
+                "precio": price_str,
+                "sku": "N/A",
                 "url": "",
-                "error": str(e),
-                "encontrado": False
-            }]
+                "encontrado": True
+            })
+            print(f"[Google Shopping] {len(results)}. {retailer}: {price_str}")
+
+        except Exception as e:
+            print(f"[Google Shopping] Error en tarjeta {idx+1}: {e}")
+            continue
+
+    return results
 
 
-# Función de prueba
+def _error_result(url: str, error: str) -> dict:
+    return {
+        "retailer": "Google Shopping",
+        "nombre": "Error",
+        "precio": "N/A",
+        "sku": "N/A",
+        "url": url,
+        "encontrado": False,
+        "error": error
+    }
+
+
 if __name__ == "__main__":
     results = asyncio.run(scrape_google_shopping("Leche Entera Natural Soprole 1L"))
     print("\n=== Resultados de Google Shopping ===")
@@ -416,5 +377,5 @@ if __name__ == "__main__":
         print(f"\n{i}. {result['retailer']}")
         print(f"   Producto: {result['nombre']}")
         print(f"   Precio: {result['precio']}")
-        if result['url']:
+        if result.get('url'):
             print(f"   URL: {result['url'][:80]}...")
